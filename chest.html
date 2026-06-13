@@ -233,10 +233,10 @@
         background: var(--surface);
         color: var(--text);
         border: 2px solid var(--border-color);
-        border-radius: 12px;
-        padding: 12px 22px;
-        font-size: 18px;
-        font-weight: 700;
+        border-radius: 14px;
+        padding: 18px 34px;
+        font-size: clamp(20px, 2.4vw, 30px);
+        font-weight: 800;
         cursor: none;
         white-space: nowrap;
       }
@@ -439,7 +439,8 @@
       .player-box {
         position: relative;
         width: min(94vw, 1400px);
-        aspect-ratio: 16/9;
+        height: min(52.875vw, 78.75vh, 787px); /* 16:9 от ширины, но не выше экрана */
+        max-height: 86vh;
         background: #000;
         border-radius: 14px;
         overflow: hidden;
@@ -447,6 +448,7 @@
         box-shadow: 0 0 60px rgba(0, 0, 0, 0.8);
       }
       .player-box iframe {
+        display: block;
         width: 100%;
         height: 100%;
         border: 0;
@@ -1086,8 +1088,17 @@
       //  КОНСТАНТЫ И СОСТОЯНИЕ
       // ══════════════════════════════════════════════════════
       const VIDEOS_PER_CHANNEL = 10;
-      // CORS-прокси для загрузки RSS со сторонних сайтов
-      const RSS_PROXY = "https://api.allorigins.win/raw?url=";
+      // Список CORS-прокси для загрузки RSS. Сайт может быть недоступен
+      // напрямую (блокировка провайдера), поэтому запрос всегда идёт
+      // через серверный прокси, у которого блокировки нет.
+      // Пробуем по очереди — если один не отвечает, берём следующий.
+      const RSS_PROXIES = [
+        (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+        (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+        (u) =>
+          "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(u),
+        (u) => "https://thingproxy.freeboard.io/fetch/" + u,
+      ];
 
       let API_KEY = localStorage.getItem("kuzya_api_key") || "";
       // Текущий раздел: 'menu' | 'video' | 'news'
@@ -1158,9 +1169,7 @@
 
         setTimeout(() => {
           const texts = Array.isArray(phrases) ? phrases : [phrases];
-          const selectedVoice = voices.find(
-            (v) => v.voiceURI === savedVoiceURI,
-          );
+          const selectedVoice = voices.find((v) => v.voiceURI === savedVoiceURI);
 
           texts.forEach((text, i) => {
             const ut = new SpeechSynthesisUtterance(text);
@@ -1786,9 +1795,7 @@
           emptyState.querySelector("p").textContent =
             "Нажмите «Esc» и добавьте ссылку на RSS";
           emptyState.style.display = "block";
-          speak(
-            "Нет источника новостей. Нажмите Эскейп, чтобы добавить ссылку.",
-          );
+          speak("Нет источника новостей. Нажмите Эскейп, чтобы добавить ссылку.");
           isRefreshing = false;
           return;
         }
@@ -1804,8 +1811,7 @@
           hideProgress();
 
           if (!items.length) {
-            emptyState.querySelector("h2").textContent =
-              "Новости не найдены 😕";
+            emptyState.querySelector("h2").textContent = "Новости не найдены 😕";
             emptyState.style.display = "block";
             speak("Новости не найдены");
           } else {
@@ -1828,16 +1834,25 @@
       }
 
       async function fetchRss(url) {
-        // Сначала пробуем напрямую, при ошибке CORS — через прокси
-        try {
-          const res = await fetch(url);
-          if (res.ok) return await res.text();
-          throw new Error("direct failed");
-        } catch (e) {
-          const res = await fetch(RSS_PROXY + encodeURIComponent(url));
-          if (!res.ok) throw new Error("proxy failed");
-          return await res.text();
+        // Прямой запрос пропускаем — сайт может быть заблокирован у
+        // пользователя. Идём сразу через прокси, перебирая список.
+        let lastErr = null;
+        for (let i = 0; i < RSS_PROXIES.length; i++) {
+          setProgress(40 + (i / RSS_PROXIES.length) * 30, "Загрузка…");
+          try {
+            const res = await fetch(RSS_PROXIES[i](url));
+            if (!res.ok) throw new Error("status " + res.status);
+            const text = await res.text();
+            // Проверяем, что вернулся именно XML/RSS, а не страница ошибки
+            if (text && /<rss|<feed|<channel|<item/i.test(text)) {
+              return text;
+            }
+            throw new Error("not rss");
+          } catch (e) {
+            lastErr = e;
+          }
         }
+        throw lastErr || new Error("all proxies failed");
       }
 
       function parseRss(xmlText) {
@@ -1854,10 +1869,7 @@
           // Поиск картинки: enclosure -> media:content -> <img> в описании
           let image = "";
           const enclosure = item.querySelector("enclosure");
-          if (
-            enclosure &&
-            /image/i.test(enclosure.getAttribute("type") || "")
-          ) {
+          if (enclosure && /image/i.test(enclosure.getAttribute("type") || "")) {
             image = enclosure.getAttribute("url") || "";
           }
           if (!image) {
@@ -1887,7 +1899,16 @@
       function stripHtml(str) {
         const tmp = document.createElement("div");
         tmp.innerHTML = str;
-        return tmp.textContent || tmp.innerText || "";
+        // Удаляем любые медиа и служебные элементы целиком,
+        // чтобы они не попали ни в текст, ни в озвучку
+        tmp
+          .querySelectorAll(
+            "img, picture, source, video, audio, iframe, figure, figcaption, script, style, noscript",
+          )
+          .forEach((el) => el.remove());
+        const text = tmp.textContent || tmp.innerText || "";
+        // Схлопываем переносы строк и лишние пробелы
+        return text.replace(/\s+/g, " ").trim();
       }
 
       // Глобальное состояние озвучки новостей
@@ -1981,21 +2002,13 @@
 
       // Дата в формате "13.06.2026 14:47:28" -> человекочитаемая
       function formatNewsDate(raw) {
-        const m = raw.match(/(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+        const m = raw.match(
+          /(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2}))?/,
+        );
         if (m) {
           const months = [
-            "января",
-            "февраля",
-            "марта",
-            "апреля",
-            "мая",
-            "июня",
-            "июля",
-            "августа",
-            "сентября",
-            "октября",
-            "ноября",
-            "декабря",
+            "января", "февраля", "марта", "апреля", "мая", "июня",
+            "июля", "августа", "сентября", "октября", "ноября", "декабря",
           ];
           const day = parseInt(m[1], 10);
           const mon = months[parseInt(m[2], 10) - 1] || m[2];
