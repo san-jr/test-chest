@@ -439,19 +439,33 @@
       .player-box {
         position: relative;
         width: min(94vw, 1400px);
-        height: min(52.875vw, 78.75vh, 787px); /* 16:9 от ширины, но не выше экрана */
-        max-height: 86vh;
+        height: min(52.875vw, 86vh);
         background: #000;
         border-radius: 14px;
         overflow: hidden;
         border: 2px solid var(--border-color);
         box-shadow: 0 0 60px rgba(0, 0, 0, 0.8);
       }
+      #player-mount {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
       .player-box iframe {
         display: block;
         width: 100%;
         height: 100%;
         border: 0;
+      }
+      /* Прозрачный слой поверх видео: держит крупный курсор «живым»
+         (iframe ютуба перехватывает курсор и наш большой пропадает).
+         Клик по слою — пауза/воспроизведение через YouTube API. */
+      #player-shield {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        cursor: none;
       }
       #player-close {
         position: absolute;
@@ -963,8 +977,9 @@
     <!-- ВСТРОЕННЫЙ ПЛЕЕР -->
     <div id="player-overlay">
       <div class="player-box">
-        <button id="player-close" title="Закрыть">✕</button>
         <div id="player-mount"></div>
+        <div id="player-shield" title="Нажмите, чтобы поставить на паузу"></div>
+        <button id="player-close" title="Закрыть">✕</button>
       </div>
     </div>
 
@@ -1754,22 +1769,81 @@
       // ══════════════════════════════════════════════════════
       const playerOverlay = document.getElementById("player-overlay");
       const playerMount = document.getElementById("player-mount");
+      const playerShield = document.getElementById("player-shield");
+
+      // Загрузка YouTube IFrame API (один раз)
+      let ytApiReady = false;
+      let ytPlayer = null;
+      let pendingVideo = null;
+      (function loadYTApi() {
+        const tag = document.createElement("script");
+        tag.src = "https://www.youtube.com/iframe_api";
+        document.head.appendChild(tag);
+      })();
+      window.onYouTubeIframeAPIReady = function () {
+        ytApiReady = true;
+        if (pendingVideo) {
+          const { id, title } = pendingVideo;
+          pendingVideo = null;
+          createPlayer(id, title);
+        }
+      };
+
+      function createPlayer(videoId, title) {
+        playerMount.innerHTML = '<div id="yt-player"></div>';
+        ytPlayer = new YT.Player("yt-player", {
+          width: "100%",
+          height: "100%",
+          videoId: videoId,
+          playerVars: {
+            autoplay: 1,
+            rel: 0,
+            modestbranding: 1,
+            playsinline: 1,
+          },
+          events: {
+            onReady: (e) => e.target.playVideo(),
+          },
+        });
+      }
 
       function openPlayer(videoId, title) {
         stopSpeaking();
-        playerMount.innerHTML = `<iframe
-            src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(videoId)}?autoplay=1&rel=0&modestbranding=1"
-            allow="autoplay; encrypted-media; fullscreen"
-            allowfullscreen></iframe>`;
         playerOverlay.classList.add("open");
         if (title) speak(`Включаю видео: ${title}`);
+        if (ytApiReady && window.YT && window.YT.Player) {
+          createPlayer(videoId, title);
+        } else {
+          // API ещё грузится — запомним и создадим позже
+          pendingVideo = { id: videoId, title };
+        }
       }
 
       function closePlayer() {
         playerOverlay.classList.remove("open");
-        playerMount.innerHTML = ""; // остановка видео
+        if (ytPlayer && ytPlayer.destroy) {
+          try {
+            ytPlayer.destroy();
+          } catch (e) {}
+        }
+        ytPlayer = null;
+        pendingVideo = null;
+        playerMount.innerHTML = "";
         stopSpeaking();
       }
+
+      // Клик по прозрачному слою — пауза / продолжить
+      playerShield.addEventListener("click", () => {
+        if (!ytPlayer || !ytPlayer.getPlayerState) return;
+        const state = ytPlayer.getPlayerState();
+        // 1 = playing
+        if (state === 1) {
+          ytPlayer.pauseVideo();
+          speak("Пауза");
+        } else {
+          ytPlayer.playVideo();
+        }
+      });
 
       document
         .getElementById("player-close")
@@ -1855,6 +1929,83 @@
         throw lastErr || new Error("all proxies failed");
       }
 
+      // Признаки страницы-заглушки Cloudflare (защита от ботов).
+      // Если сайт закрыт такой проверкой, полный текст получить нельзя —
+      // тихо оставляем то, что есть в RSS.
+      function isBlockedPage(html) {
+        return /Just a moment|cf_chl|challenge-platform|Enable JavaScript and cookies/i.test(
+          html,
+        );
+      }
+
+      // Загрузка HTML страницы поста через прокси (с перебором)
+      async function fetchPage(url) {
+        let lastErr = null;
+        for (let i = 0; i < RSS_PROXIES.length; i++) {
+          try {
+            const res = await fetch(RSS_PROXIES[i](url));
+            if (!res.ok) throw new Error("status " + res.status);
+            const text = await res.text();
+            if (text && text.length > 200 && !isBlockedPage(text)) {
+              return text;
+            }
+            throw new Error(isBlockedPage(text) ? "blocked" : "empty");
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        throw lastErr || new Error("page fetch failed");
+      }
+
+      // Извлекаем обложку (og:image) и основной текст статьи.
+      // Все медиа (видео, аудио, встроенные картинки) игнорируются —
+      // берём только текст и одну обложку.
+      function extractArticle(html, pageUrl) {
+        const doc = new DOMParser().parseFromString(html, "text/html");
+
+        // ── Обложка: og:image / twitter:image ──
+        let image = "";
+        const og =
+          doc.querySelector('meta[property="og:image"]') ||
+          doc.querySelector('meta[name="og:image"]') ||
+          doc.querySelector('meta[name="twitter:image"]');
+        if (og) image = og.getAttribute("content") || "";
+
+        // ── Основной текст ──
+        // Пробуем типичные контейнеры статьи, иначе берём <article>/<main>
+        const candidates = [
+          "article",
+          "[itemprop='articleBody']",
+          ".article-body",
+          ".article__body",
+          ".node__content",
+          ".field--name-body",
+          ".content .field-item",
+          "main",
+        ];
+        let container = null;
+        for (const sel of candidates) {
+          const el = doc.querySelector(sel);
+          if (el && el.textContent.trim().length > 120) {
+            container = el;
+            break;
+          }
+        }
+        let text = "";
+        if (container) {
+          const clone = container.cloneNode(true);
+          // Выкидываем всё нетекстовое и навигационное
+          clone
+            .querySelectorAll(
+              "img, picture, source, video, audio, iframe, figure, figcaption, script, style, noscript, nav, header, footer, aside, form, .share, .social, .related, .comments, .ads, .advertisement",
+            )
+            .forEach((el) => el.remove());
+          text = (clone.textContent || "").replace(/\s+/g, " ").trim();
+        }
+
+        return { image, text };
+      }
+
       function parseRss(xmlText) {
         const doc = new DOMParser().parseFromString(xmlText, "text/xml");
         const items = [...doc.querySelectorAll("item")];
@@ -1919,14 +2070,13 @@
         items.forEach((n) => {
           const card = document.createElement("div");
           card.className = "news-card";
+          n._card = card; // ссылка для фонового обновления
 
           const thumbHtml = n.image
             ? `<div class="news-thumb-wrap"><img src="${esc(n.image)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=&quot;news-thumb-placeholder&quot;>📰</div>'"></div>`
             : `<div class="news-thumb-wrap"><div class="news-thumb-placeholder">📰</div></div>`;
 
-          const descHtml = n.desc
-            ? `<div class="news-desc">${esc(n.desc)}</div>`
-            : "";
+          const descHtml = `<div class="news-desc">${esc(n.desc || "")}</div>`;
           const dateHtml = n.date
             ? `<div class="news-date">${esc(formatNewsDate(n.date))}</div>`
             : "";
@@ -1954,24 +2104,56 @@
           card.addEventListener("click", (e) => {
             e.stopPropagation();
             if (activeNewsCard === card) {
-              // повторный клик по тому же посту — стоп
               stopNewsSpeaking();
               return;
             }
-            // клик по другому посту во время чтения — переключаемся
             stopNewsSpeaking();
             startNewsSpeaking(card, n);
           });
 
           feed.appendChild(card);
         });
+
+        // Фоновая дозагрузка обложки и полного текста с самих страниц.
+        enrichNews(items);
+      }
+
+      // Догружаем полный текст и картинку с каждой страницы поста.
+      // Делаем последовательно и тихо: если сайт закрыт Cloudflare —
+      // просто оставляем данные из RSS.
+      async function enrichNews(items) {
+        for (const n of items) {
+          if (!n.link) continue;
+          try {
+            const html = await fetchPage(n.link);
+            const { image, text } = extractArticle(html, n.link);
+
+            if (image && n._card) {
+              const wrap = n._card.querySelector(".news-thumb-wrap");
+              if (wrap) {
+                wrap.innerHTML = `<img src="${esc(image)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=&quot;news-thumb-placeholder&quot;>📰</div>'">`;
+              }
+              n.image = image;
+            }
+            if (text && text.length > (n.desc || "").length) {
+              n.fullText = text;
+              if (n._card) {
+                const descEl = n._card.querySelector(".news-desc");
+                if (descEl) descEl.textContent = text;
+              }
+            }
+          } catch (e) {
+            // страница недоступна/закрыта — тихо пропускаем
+          }
+        }
       }
 
       function startNewsSpeaking(card, n) {
         activeNewsCard = card;
         card.classList.add("speaking");
         const parts = [n.title];
-        if (n.desc) parts.push(n.desc);
+        const body = n.fullText || n.desc;
+        if (body) parts.push(body);
         speak(parts, {
           onend: () => {
             // чтение завершилось само
